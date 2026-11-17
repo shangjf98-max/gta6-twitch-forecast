@@ -9,13 +9,15 @@ launches, each with a full release-day curve):
     the case itself tiers as early-access-contaminated or weak are left
     out when enough remain.
 2.  For each hour h = 2..24, regress the log ratio log(viewers_h /
-    viewers_1) on log(viewers_1) across the pool.  The slope is near
-    zero in the small hours and about -0.45 by the evening: a launch
-    whose first hour is already enormous has less headroom left, while
-    a modest first hour leaves room for the US unlock ramp.  The slope
-    is shrunk by 0.9, and beyond the pool's log(viewers_1) range only
-    half the slope applies, so an unprecedented first hour is not
-    extrapolated linearly into a collapse.
+    viewers_1) on log(viewers_1) across the pool, with two Huber
+    reweighting passes so one wild analogue cannot drag the shape.
+    The slope is near zero in the small hours and about -0.45 by the
+    evening: a launch whose first hour is already enormous has less
+    headroom left, while a modest first hour leaves room for the US
+    unlock ramp.  The slope is shrunk by 0.9, and beyond the pool's
+    log(viewers_1) range only half the slope applies, so an
+    unprecedented first hour is not extrapolated linearly into a
+    collapse.
 3.  The forecast for hour h is lognormal: median p1 * exp(mu_h), spread
     from the regression's residual standard deviation, smoothed over
     neighbouring hours.  Quantiles come from the normal quantile
@@ -36,6 +38,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import NormalDist
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
@@ -60,39 +63,18 @@ SD_CAP = 1.0
 PERSISTENCE_SIGMA = 0.15
 
 
-def norm_ppf(p):
-    """Inverse standard-normal CDF (Acklam's rational approximation).
+_NORMAL = NormalDist()
 
-    Accurate to about 1e-9 over the open unit interval; the scored
-    levels 0.05/0.25/0.5/0.75/0.95 come out within a whisker of the
-    textbook z values.  Deterministic and dependency-free.
+
+def norm_ppf(p):
+    """Inverse standard-normal CDF, exact to machine precision.
+
+    The standard library's NormalDist (Wichura's AS 241) replaces a
+    hand-rolled rational approximation: no coefficient table to
+    mistype, and the scored levels come out at the textbook z values.
+    Clamped away from 0 and 1 so the function is total.
     """
-    p = min(max(p, 0.0001), 0.9999)
-    a = [-3.969683028665376e01, 2.209460984245205e02,
-         -2.759285984469534e02, 1.383577518672690e02,
-         -3.066479806614716e01, 2.506628277459239e00]
-    b = [-5.447609879822406e01, 1.615858368580409e02,
-         -1.556989798598866e02, 6.680131188771972e01,
-         -1.328068155288572e01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01,
-         -2.400758277161838e00, -2.549732539343734e00,
-         4.374664141464968e00, 2.938163982698783e00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01,
-         2.445134137142996e00, 3.754408661907416e00]
-    plow = 0.02425
-    phigh = 1.0 - plow
-    if p < plow:
-        q = math.sqrt(-2.0 * math.log(p))
-        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    if p > phigh:
-        q = math.sqrt(-2.0 * math.log(1.0 - p))
-        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    q = p - 0.5
-    r = q * q
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
-        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    return _NORMAL.inv_cdf(min(max(p, 0.0001), 0.9999))
 
 
 def parse_time(text):
@@ -114,26 +96,41 @@ def round_half_up_2dp(x):
     return int(scaled) if scaled.is_integer() else scaled
 
 
+def is_number(value):
+    """True for a finite JSON number (bools, NaN and inf excluded)."""
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def format_quantiles(quantiles):
+    """Clamp to the scored range, enforce order, round for output."""
+    bounded = [min(max(q, 1.0), 1_000_000_000.0) for q in quantiles]
+    for i in range(1, len(bounded)):
+        bounded[i] = max(bounded[i], bounded[i - 1])
+    return [round_half_up_2dp(q) for q in bounded]
+
+
 def release_day_curve(comparable):
     """Return {hour: viewers} for hours 1..24 of a comparable's day.
 
     Hours come from the hourly points whose timestamp falls on the
     release day's hour grid; points off the grid or with no positive
-    viewer count are ignored.  None when the day start is unusable.
+    finite viewer count are ignored, and repeated points for one hour
+    are averaged.  None when the day start is unusable.
     """
     day_start = parse_time(comparable.get("day_start"))
     hourly = comparable.get("hourly")
     if day_start is None or not isinstance(hourly, list):
         return None
-    curve = {}
+    totals = {}
+    counts = {}
     for point in hourly:
         if not isinstance(point, dict):
             continue
         moment = parse_time(point.get("from"))
         viewers = point.get("viewers")
-        if moment is None or not isinstance(viewers, (int, float)):
-            continue
-        if viewers <= 0:
+        if moment is None or not is_number(viewers) or viewers <= 0:
             continue
         offset = (moment - day_start).total_seconds()
         if offset < 0 or offset >= 24 * 3600:
@@ -141,8 +138,9 @@ def release_day_curve(comparable):
         if abs(offset - round(offset / 3600.0) * 3600.0) > 60:
             continue
         hour = int(round(offset / 3600.0)) + 1
-        curve[hour] = float(viewers)
-    return curve
+        totals[hour] = totals.get(hour, 0.0) + float(viewers)
+        counts[hour] = counts.get(hour, 0) + 1
+    return {hour: totals[hour] / counts[hour] for hour in totals}
 
 
 def comparable_tier(comparable):
@@ -157,9 +155,9 @@ def comparable_tier(comparable):
 def build_pool(comparables):
     """Select the analogue pool, relaxing filters only if too small.
 
-    Each pool member is (log_first_hour, {hour: log_ratio}) with
-    log_ratio = log(viewers_h / viewers_1).  Returns an empty list
-    when nothing usable exists.
+    Each pool member is a dict with log_first (the log of hour 1's
+    viewers), ratios ({hour: log(viewers_h / viewers_1)}), live_ratio
+    and tier.  Returns an empty list when nothing usable exists.
     """
     candidates = []
     for comparable in comparables or []:
@@ -193,9 +191,13 @@ def build_pool(comparables):
 
 
 def fit_hour(pool, hour, log_first_target):
-    """OLS of log ratio on log first hour for one hour; (mu, sd).
+    """Robust regression of log ratio on log first hour; (mu, sd).
 
-    Returns None when fewer than five pool members carry this hour.
+    Ordinary least squares, then two Huber reweighting passes: pool
+    members whose residual is far from the fit (a launch whose day
+    ramped nothing like the rest) are downweighted, so one wild
+    analogue cannot drag the hour's shape.  Returns None when fewer
+    than five pool members carry this hour.
     """
     xs = []
     ys = []
@@ -213,6 +215,23 @@ def fit_hour(pool, hour, log_first_target):
     if denom > 0:
         slope = sum((x - mean_x) * (y - mean_y)
                     for x, y in zip(xs, ys)) / denom
+    for _ in range(2):
+        residuals = [y - (mean_y + slope * (x - mean_x))
+                     for x, y in zip(xs, ys)]
+        ordered = sorted(abs(r) for r in residuals)
+        mad = ordered[len(ordered) // 2] or 0.1
+        cutoff = 1.345 * 1.4826 * mad
+        weights = [1.0 if abs(r) <= cutoff else cutoff / abs(r)
+                   for r in residuals]
+        total = sum(weights)
+        mean_x = sum(w * x for w, x in zip(weights, xs)) / total
+        mean_y = sum(w * y for w, y in zip(weights, ys)) / total
+        denom = sum(w * (x - mean_x) ** 2
+                    for w, x in zip(weights, xs))
+        slope = 0.0
+        if denom > 0:
+            slope = sum(w * (x - mean_x) * (y - mean_y)
+                        for w, x, y in zip(weights, xs, ys)) / denom
     slope *= SLOPE_SHRINK
     x = log_first_target
     low, high = min(xs), max(xs)
@@ -277,19 +296,29 @@ def forecast_case(case, name):
                    or not 0.0 < level < 1.0 for level in levels)):
         levels = [0.05, 0.25, 0.5, 0.75, 0.95]
     z_values = [norm_ppf(float(level)) for level in levels]
-    forecast_rows = case.get("forecast") or [{"hour": h} for h in range(2, 25)]
+    forecast_rows = case.get("forecast")
     hours = []
-    for row in forecast_rows:
-        if isinstance(row, dict) and isinstance(row.get("hour"), int):
-            hours.append(row["hour"])
-    if not hours:
+    seen = set()
+    if isinstance(forecast_rows, list):
+        for row in forecast_rows:
+            if not isinstance(row, dict):
+                continue
+            hour = row.get("hour")
+            if type(hour) is not int or hour in seen:
+                continue
+            seen.add(hour)
+            hours.append(hour)
+    # The scored shape is exactly hours 2..24, each once.  Anything
+    # else in the case file (a duplicate, hour 1, an out-of-range
+    # hour) falls back to the full set rather than emitting bad rows.
+    if sorted(hours) != list(range(2, 25)):
         hours = list(range(2, 25))
 
     p1 = None
     for row in case.get("known") or []:
         if isinstance(row, dict) and row.get("hour") == 1:
             viewers = row.get("viewers")
-            if isinstance(viewers, (int, float)) and viewers > 0:
+            if is_number(viewers) and viewers > 0:
                 p1 = float(viewers)
                 break
     if p1 is None:
@@ -303,7 +332,7 @@ def forecast_case(case, name):
             if not isinstance(point, dict):
                 continue
             viewers = point.get("viewers")
-            if not (isinstance(viewers, (int, float)) and viewers > 0):
+            if not (is_number(viewers) and viewers > 0):
                 continue
             fallback = float(viewers)
             if day_start is not None and parse_time(point.get("from")) == day_start:
@@ -323,37 +352,48 @@ def forecast_case(case, name):
             quantiles = [p1 * math.exp(mu + z * sd) for z in z_values]
         else:
             quantiles = persistence_quantiles(p1, hour, z_values)
-        quantiles = [min(max(q, 1.0), 1_000_000_000.0) for q in quantiles]
-        for i in range(1, len(quantiles)):
-            quantiles[i] = max(quantiles[i], quantiles[i - 1])
-        rows.append({"hour": hour,
-                     "q": [round_half_up_2dp(q) for q in quantiles]})
+        rows.append({"hour": hour, "q": format_quantiles(quantiles)})
     return {"hours": rows}
+
+
+def fallback_forecast(case):
+    """Last-resort forecast: persistence from hour 1, valid shape.
+
+    Used only when the model path fails for a case; never raises, so
+    a graded run always leaves an output file for every input.
+    """
+    p1 = 1000.0
+    if isinstance(case, dict):
+        for row in case.get("known") or []:
+            if isinstance(row, dict) and row.get("hour") == 1:
+                viewers = row.get("viewers")
+                if is_number(viewers) and viewers > 0:
+                    p1 = float(viewers)
+                    break
+    z_values = [norm_ppf(level)
+                for level in (0.05, 0.25, 0.5, 0.75, 0.95)]
+    return {"hours": [
+        {"hour": h,
+         "q": format_quantiles(persistence_quantiles(p1, h, z_values))}
+        for h in range(2, 25)]}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     inputs = sorted(INPUT_DIR.glob("*.in"))
+    if not inputs:
+        print(f"no *.in files in {INPUT_DIR}", flush=True)
     for path in inputs:
-        case = json.loads(path.read_text(encoding="utf-8"))
+        case = None
         try:
+            case = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(case, dict):
+                raise ValueError("case is not a JSON object")
             forecast = forecast_case(case, path.name)
         except Exception as exc:  # never crash a graded run
             print(f"{path.name}: model failed ({exc}); "
                   f"writing persistence fallback", flush=True)
-            p1 = 1000.0
-            for row in case.get("known") or []:
-                if isinstance(row, dict) and row.get("hour") == 1:
-                    viewers = row.get("viewers")
-                    if isinstance(viewers, (int, float)) and viewers > 0:
-                        p1 = float(viewers)
-            z_values = [norm_ppf(level)
-                        for level in (0.05, 0.25, 0.5, 0.75, 0.95)]
-            forecast = {"hours": [
-                {"hour": h,
-                 "q": [round_half_up_2dp(q) for q in
-                       persistence_quantiles(p1, h, z_values)]}
-                for h in range(2, 25)]}
+            forecast = fallback_forecast(case)
         out_path = OUTPUT_DIR / f"{path.stem}.out"
         out_path.write_text(
             json.dumps(forecast, separators=(",", ":")) + "\n",
