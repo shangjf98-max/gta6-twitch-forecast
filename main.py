@@ -61,6 +61,19 @@ SD_CAP = 1.0
 # Fallback spread for the persistence forecast, in log units per
 # square-root hour, used only when no usable pool exists.
 PERSISTENCE_SIGMA = 0.15
+# Huber reweighting: two passes, Huber's 1.345 cutoff scaled from the
+# median absolute deviation (1.4826 makes it consistent for the
+# normal), with a floor so a zero MAD cannot divide by zero.
+HUBER_PASSES = 2
+HUBER_K = 1.345
+MAD_TO_SD = 1.4826
+MAD_FLOOR = 0.1
+# Guards against numerically pathological pools: a fitted slope or
+# log-ratio median beyond these cannot come from real Twitch curves
+# (observed slopes stay within 0.5, medians within 3), so clamping
+# here only ever bites on corrupt input, never on graded cases.
+SLOPE_LIMIT = 3.0
+MU_LIMIT = 10.0
 
 
 _NORMAL = NormalDist()
@@ -97,10 +110,17 @@ def round_half_up_2dp(x):
 
 
 def is_number(value):
-    """True for a finite JSON number (bools, NaN and inf excluded)."""
-    return (isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value))
+    """True for a finite JSON number (bools, NaN and inf excluded).
+
+    JSON parsing yields exactly int and float, so exact type checks
+    suffice and are faster than isinstance here: this runs once per
+    hourly point, tens of thousands of times a case.
+    """
+    if type(value) is int:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    return False
 
 
 def format_quantiles(quantiles):
@@ -160,7 +180,9 @@ def build_pool(comparables):
     and tier.  Returns an empty list when nothing usable exists.
     """
     candidates = []
-    for comparable in comparables or []:
+    if not isinstance(comparables, list):
+        return []
+    for comparable in comparables:
         if not isinstance(comparable, dict):
             continue
         curve = release_day_curve(comparable)
@@ -215,12 +237,12 @@ def fit_hour(pool, hour, log_first_target):
     if denom > 0:
         slope = sum((x - mean_x) * (y - mean_y)
                     for x, y in zip(xs, ys)) / denom
-    for _ in range(2):
+    for _ in range(HUBER_PASSES):
         residuals = [y - (mean_y + slope * (x - mean_x))
                      for x, y in zip(xs, ys)]
         ordered = sorted(abs(r) for r in residuals)
-        mad = ordered[len(ordered) // 2] or 0.1
-        cutoff = 1.345 * 1.4826 * mad
+        mad = ordered[len(ordered) // 2] or MAD_FLOOR
+        cutoff = HUBER_K * MAD_TO_SD * mad
         weights = [1.0 if abs(r) <= cutoff else cutoff / abs(r)
                    for r in residuals]
         total = sum(weights)
@@ -233,13 +255,14 @@ def fit_hour(pool, hour, log_first_target):
             slope = sum(w * (x - mean_x) * (y - mean_y)
                         for w, x, y in zip(weights, xs, ys)) / denom
     slope *= SLOPE_SHRINK
+    slope = min(max(slope, -SLOPE_LIMIT), SLOPE_LIMIT)
     x = log_first_target
     low, high = min(xs), max(xs)
     if x > high:
         x = high + EXTRAPOLATION_SLOPE * (x - high)
     elif x < low:
         x = low + EXTRAPOLATION_SLOPE * (x - low)
-    mu = mean_y + slope * (x - mean_x)
+    mu = min(max(mean_y + slope * (x - mean_x), -MU_LIMIT), MU_LIMIT)
     resid_sq = sum((y - (mean_y + slope * (xx - mean_x))) ** 2
                    for xx, y in zip(xs, ys))
     sd = math.sqrt(resid_sq / n)
@@ -247,7 +270,7 @@ def fit_hour(pool, hour, log_first_target):
 
 
 def smooth(values):
-    """Three-point moving average over neighbouring hours (edges: two)."""
+    """Moving average of each hour with its fitted neighbours."""
     smoothed = {}
     for hour, value in values.items():
         neighbours = [values[h] for h in (hour - 1, hour, hour + 1)
@@ -288,7 +311,38 @@ def persistence_quantiles(p1, hour, z_values):
     return [p1 * math.exp(z * spread) for z in z_values]
 
 
-def forecast_case(case, name):
+def first_hour_viewers(case):
+    """Hour 1's viewer count: the known print, else history, else 1000.
+
+    Without a known hour-1 print, prefers the hourly mean for the
+    day's first hour itself, else the last pre-checkpoint hourly mean.
+    Always returns a positive finite number; never raises.
+    """
+    known = case.get("known")
+    if isinstance(known, list):
+        for row in known:
+            if isinstance(row, dict) and row.get("hour") == 1:
+                viewers = row.get("viewers")
+                if is_number(viewers) and viewers > 0:
+                    return float(viewers)
+    fallback = None
+    day_start = parse_time(case.get("day_start"))
+    hourly = case.get("history_hourly")
+    if not isinstance(hourly, list):
+        hourly = []
+    for point in hourly:
+        if not isinstance(point, dict):
+            continue
+        viewers = point.get("viewers")
+        if not (is_number(viewers) and viewers > 0):
+            continue
+        fallback = float(viewers)
+        if day_start is not None and parse_time(point.get("from")) == day_start:
+            break
+    return fallback if fallback is not None else 1000.0
+
+
+def forecast_case(case):
     """Forecast one case dict; always returns a valid-shaped object."""
     levels = case.get("levels")
     if (not isinstance(levels, list) or not levels
@@ -314,31 +368,7 @@ def forecast_case(case, name):
     if sorted(hours) != list(range(2, 25)):
         hours = list(range(2, 25))
 
-    p1 = None
-    for row in case.get("known") or []:
-        if isinstance(row, dict) and row.get("hour") == 1:
-            viewers = row.get("viewers")
-            if is_number(viewers) and viewers > 0:
-                p1 = float(viewers)
-                break
-    if p1 is None:
-        # No hour-1 print: prefer the hourly mean for the day's first
-        # hour itself, else the last pre-checkpoint hourly mean, else
-        # a neutral scale.  The shape still comes from the pool.
-        hourly = case.get("history_hourly") or []
-        day_start = parse_time(case.get("day_start"))
-        fallback = None
-        for point in hourly:
-            if not isinstance(point, dict):
-                continue
-            viewers = point.get("viewers")
-            if not (is_number(viewers) and viewers > 0):
-                continue
-            fallback = float(viewers)
-            if day_start is not None and parse_time(point.get("from")) == day_start:
-                fallback = float(viewers)
-                break
-        p1 = fallback if fallback is not None else 1000.0
+    p1 = first_hour_viewers(case)
 
     shape = None
     pool = build_pool(case.get("comparables"))
@@ -362,14 +392,7 @@ def fallback_forecast(case):
     Used only when the model path fails for a case; never raises, so
     a graded run always leaves an output file for every input.
     """
-    p1 = 1000.0
-    if isinstance(case, dict):
-        for row in case.get("known") or []:
-            if isinstance(row, dict) and row.get("hour") == 1:
-                viewers = row.get("viewers")
-                if is_number(viewers) and viewers > 0:
-                    p1 = float(viewers)
-                    break
+    p1 = first_hour_viewers(case) if isinstance(case, dict) else 1000.0
     z_values = [norm_ppf(level)
                 for level in (0.05, 0.25, 0.5, 0.75, 0.95)]
     return {"hours": [
@@ -389,7 +412,7 @@ def main():
             case = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(case, dict):
                 raise ValueError("case is not a JSON object")
-            forecast = forecast_case(case, path.name)
+            forecast = forecast_case(case)
         except Exception as exc:  # never crash a graded run
             print(f"{path.name}: model failed ({exc}); "
                   f"writing persistence fallback", flush=True)
